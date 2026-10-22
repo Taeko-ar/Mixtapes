@@ -26,7 +26,28 @@ env:
   MACOSX_DEPLOYMENT_TARGET: "15.0"
 
 jobs:
+  icon:
+    # Xcode 26's actool compiles the layered icon only on macOS 26. The build
+    # jobs stay on macOS 15, so the app keeps running there.
+    runs-on: macos-26
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Compile the icon
+        run: |
+          xcodebuild -version
+          bash mac/icon.sh icon "$MACOSX_DEPLOYMENT_TARGET"
+
+      - name: Upload the icon
+        uses: actions/upload-artifact@v4
+        with:
+          name: macos-icon
+          path: icon/Assets.car
+          if-no-files-found: error
+
   build-macos:
+    needs: icon
     strategy:
       fail-fast: false
       matrix:
@@ -44,17 +65,11 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Xcode 26
-        # actool compiles mac/Mixtapes.icon for macOS 26 only from Xcode 26.
-        # Without it the app keeps the flat icon.
-        run: |
-          xcode=$(ls -d /Applications/Xcode_26*.app 2>/dev/null | sort -V | tail -n 1 || true)
-          if [[ -n "$xcode" ]]; then
-            sudo xcode-select -s "$xcode"
-          else
-            echo "::warning::No Xcode 26 on this runner, the DMG gets the flat icon only"
-          fi
-          xcodebuild -version
+      - name: Download the icon
+        uses: actions/download-artifact@v4
+        with:
+          name: macos-icon
+          path: icon
 
       - name: Homebrew packages
         # The tools run on the runner itself, so they are arm64 for both builds.
@@ -115,6 +130,7 @@ jobs:
         env:
           PREFIX: ${{ matrix.prefix }}
           TARGET: ${{ matrix.target }}
+          ICON_CAR: icon/Assets.car
         run: bash mac/bundle.sh
 
       - name: Upload disk image

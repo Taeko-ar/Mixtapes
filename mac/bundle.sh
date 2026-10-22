@@ -48,18 +48,23 @@ printf 'APPL????' > "$C/PkgInfo"
 # macOS 15 and earlier.
 cp mac/mixtapes.icns "$R/"
 # The layered Liquid Glass icon from Icon Composer (mac/Mixtapes.icon), for
-# macOS 26 and later, which frame the flat icns in a grey square. actool comes
-# with Xcode 26 only. Without it the flat icon is all the app gets.
-if xcrun --find actool > /dev/null 2>&1; then
-    icon_out=$(mktemp -d)
-    xcrun actool mac/Mixtapes.icon --compile "$icon_out" --platform macosx --minimum-deployment-target "$MIN_MACOS" \
-        --app-icon Mixtapes --output-partial-info-plist "$icon_out/partial.plist" > /dev/null
+# macOS 26 and later, which frame the flat icns in a grey square. ICON_CAR
+# names an Assets.car compiled beforehand (CI does that on a macOS 26 runner);
+# otherwise mac/icon.sh compiles it here when it can. Without it the flat icon
+# is all the app gets.
+icon_out=$(mktemp -d)
+if [[ -n "${ICON_CAR:-}" ]]; then
+    cp "$ICON_CAR" "$icon_out/Assets.car"
+elif ! xcrun --find actool > /dev/null 2>&1; then
+    echo "  no actool (Xcode 26), flat icon only"
+elif ! bash mac/icon.sh "$icon_out" "$MIN_MACOS" 2> "$icon_out/actool.log"; then
+    echo "  actool failed (it needs macOS 26), flat icon only"
+fi
+if [[ -f "$icon_out/Assets.car" ]]; then
     cp "$icon_out/Assets.car" "$R/"
     /usr/libexec/PlistBuddy -c "Add :CFBundleIconName string Mixtapes" "$C/Info.plist"
-    rm -rf "$icon_out"
-else
-    echo "  no actool (Xcode 26), flat icon only"
 fi
+rm -rf "$icon_out"
 
 echo "GStreamer"
 plugins_dir=$("$PKG_CONFIG" --variable=pluginsdir gstreamer-1.0)
