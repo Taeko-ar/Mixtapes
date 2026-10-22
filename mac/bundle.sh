@@ -24,7 +24,7 @@ if [[ -z "${PREFIX:-}" ]]; then
 fi
 : "${PREFIX:?no GTK 4 install found, set PREFIX}"
 # Only this prefix: a cross build's runner has the other architecture's packages too.
-export PKG_CONFIG_LIBDIR="$PREFIX/lib/pkgconfig"
+export PKG_CONFIG_LIBDIR="$PREFIX/lib/pkgconfig:$PREFIX/share/pkgconfig"
 PKG_CONFIG=${PKG_CONFIG:-$(command -v pkg-config || command -v pkgconf || echo "$PREFIX/bin/pkg-config")}
 
 BIN=target/${TARGET:+$TARGET/}release/mixtapes
@@ -92,8 +92,9 @@ cp "$soup_lib" "$C/Frameworks/"
 
 echo "GIO modules"
 # glib-networking's TLS backend, for HTTPS inside GStreamer. It trusts the macOS keychain.
-gio_dir=$("$PKG_CONFIG" --variable=giomoduledir gio-2.0)
-cp "$gio_dir"/libgiognutls.* "$R/lib/gio/modules/"
+# From the prefix, not gio-2.0.pc: Homebrew's names glib's own keg, while
+# glib-networking links its module into the prefix.
+cp "$PREFIX"/lib/gio/modules/libgiognutls.* "$R/lib/gio/modules/"
 
 echo "Helper programs"
 # The app puts Contents/MacOS first on PATH (bootstrap::prefer_bundled_programs),
