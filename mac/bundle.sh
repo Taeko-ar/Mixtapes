@@ -23,7 +23,8 @@ if [[ -z "${PREFIX:-}" ]]; then
     done
 fi
 : "${PREFIX:?no GTK 4 install found, set PREFIX}"
-export PKG_CONFIG_PATH="$PREFIX/lib/pkgconfig${PKG_CONFIG_PATH:+:$PKG_CONFIG_PATH}"
+# Only this prefix: a cross build's runner has the other architecture's packages too.
+export PKG_CONFIG_LIBDIR="$PREFIX/lib/pkgconfig"
 PKG_CONFIG=${PKG_CONFIG:-$(command -v pkg-config || command -v pkgconf || echo "$PREFIX/bin/pkg-config")}
 
 BIN=target/${TARGET:+$TARGET/}release/mixtapes
