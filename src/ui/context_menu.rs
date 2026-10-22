@@ -11,7 +11,7 @@ use crate::model::{ItemKind, MediaItem, Track};
 use crate::player::Player;
 use crate::queue::QueueSource;
 use crate::ui::context::{NavRequest, Navigator, UiContext};
-use crate::ui::pages::library::DOWNLOADS_ID;
+use crate::ui::pages::library::{DOWNLOADS_ID, LOCAL_FILES_ID};
 use crate::ui::{copy_to_clipboard, toast};
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -111,6 +111,7 @@ pub fn build_song_menu(anchor: &impl IsA<gtk::Widget>, track: &Track, player: &R
     let count = tracks.len();
     let online = opts.ctx.as_ref().map(|c| c.online.is_online()).unwrap_or(true);
     let queueable = !vid.is_empty() || multi;
+    let has_file = tracks.iter().any(|t| crate::local_files::is_file_id(&t.video_id.0)) || crate::local_files::is_file_id(&vid);
 
     if !tracks.is_empty() && queueable && !hidden("play_next") {
         let (player, tracks) = (player.clone(), tracks.clone());
@@ -155,7 +156,7 @@ pub fn build_song_menu(anchor: &impl IsA<gtk::Widget>, track: &Track, player: &R
     }
 
     if let Some(ctx) = opts.ctx.clone() {
-        if !vid.is_empty() && online && !multi && !hidden("start_radio") {
+        if !vid.is_empty() && online && !multi && !has_file && !hidden("start_radio") {
             let anchor = anchor.clone();
             let (player, vid_c, title) = (player.clone(), vid.clone(), track.title.clone());
             builder.add(Section::Actions, "Start Radio", "start-radio", false, Rc::new(move || {
@@ -165,7 +166,7 @@ pub fn build_song_menu(anchor: &impl IsA<gtk::Widget>, track: &Track, player: &R
         }
         let to_add: Vec<Track> = if tracks.is_empty() { if vid.is_empty() { Vec::new() } else { vec![track.clone()] } } else { tracks.clone() };
         // A local playlist takes tracks offline and signed out.
-        if !to_add.is_empty() && !hidden("add_to_playlist") {
+        if !to_add.is_empty() && !has_file && !hidden("add_to_playlist") {
             let anchor = anchor.clone();
             let label = if multi { format!("Add {} to Playlist…", to_add.len()) } else { "Add to Playlist…".to_owned() };
             builder.add(Section::Actions, &label, "add-to-playlist", false, Rc::new(move || {
@@ -175,7 +176,7 @@ pub fn build_song_menu(anchor: &impl IsA<gtk::Widget>, track: &Track, player: &R
     }
 
     if let Some(ctx) = opts.ctx.clone() {
-        if !tracks.is_empty() && !hidden("download") {
+        if !tracks.is_empty() && !has_file && !hidden("download") {
             let (album_title, album_id) = opts.album.clone().unwrap_or_default();
             let pending: Vec<Track> = tracks.iter().filter(|t| !ctx.downloads.is_downloaded(&t.video_id.0)).cloned().collect();
             let downloaded_single = !multi && !vid.is_empty() && ctx.downloads.is_downloaded(&vid);
@@ -206,7 +207,7 @@ pub fn build_song_menu(anchor: &impl IsA<gtk::Widget>, track: &Track, player: &R
     }
 
     if let Some(ctx) = opts.ctx.clone() {
-        if !vid.is_empty() && online && !multi && !hidden("refresh_metadata") {
+        if !vid.is_empty() && online && !multi && !has_file && !hidden("refresh_metadata") {
             let anchor = anchor.clone();
             let vid_c = vid.clone();
             builder.add(Section::Actions, "Refresh Metadata", "refresh-metadata", false, Rc::new(move || refresh_metadata(&ctx, &anchor, &vid_c)));
@@ -217,7 +218,7 @@ pub fn build_song_menu(anchor: &impl IsA<gtk::Widget>, track: &Track, player: &R
         builder.add(extra.section, &extra.label, &format!("extra-{i}"), extra.first, extra.callback);
     }
 
-    if !vid.is_empty() && !hidden("copy_link") {
+    if !vid.is_empty() && !has_file && !hidden("copy_link") {
         let vid = vid.clone();
         let anchor = anchor.clone();
         builder.add(Section::Clipboard, "Copy Link", "copy-link", false, Rc::new(move || {
@@ -366,13 +367,16 @@ enum CollectionMode {
 
 /// Whether the list lives on this device: a local playlist, the local likes or the downloads.
 fn is_on_device(item: &MediaItem) -> bool {
-    item.kind == ItemKind::Playlist && (crate::local_library::is_local(&item.id) || item.id == DOWNLOADS_ID)
+    item.kind == ItemKind::Playlist && (crate::local_library::is_local(&item.id) || item.id == DOWNLOADS_ID || item.id == LOCAL_FILES_ID)
 }
 
 /// The tracks of a list kept on this device, which no request could answer.
 fn device_tracks(ctx: &UiContext, item: &MediaItem) -> Vec<Track> {
     if item.id == DOWNLOADS_ID {
         return ctx.downloads.all().iter().map(|entry| entry.track()).collect();
+    }
+    if item.id == LOCAL_FILES_ID {
+        return crate::local_files::known();
     }
     ctx.local.details(&item.id).map(|details| details.tracks).unwrap_or_default()
 }

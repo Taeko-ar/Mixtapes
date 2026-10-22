@@ -1032,7 +1032,7 @@ impl PlaylistPage {
     }
 
     fn is_virtual(id: &str) -> bool {
-        id.starts_with("UPLOAD") || id == "DOWNLOADS" || id == "HISTORY"
+        id.starts_with("UPLOAD") || id == "DOWNLOADS" || id == crate::local_files::PAGE_ID || id == "HISTORY"
     }
 
     fn account_name(&self) -> Option<String> {
@@ -1721,7 +1721,7 @@ impl PlaylistPage {
         if self.ctx.online.is_online() {
             return tracks;
         }
-        tracks.into_iter().filter(|t| self.ctx.downloads.is_downloaded(&t.video_id.0)).collect()
+        tracks.into_iter().filter(|t| self.ctx.downloads.is_downloaded(&t.video_id.0) || crate::local_files::is_file_id(&t.video_id.0)).collect()
     }
 
     fn on_play_clicked(self: &Rc<Self>) {
@@ -1787,6 +1787,9 @@ impl PlaylistPage {
         queue_section.append(Some("Play Next"), Some("page.play_all_next"));
         queue_section.append(Some("Add to Queue"), Some("page.add_all_to_queue"));
         self.more_menu.append_section(None, &queue_section);
+        if self.playlist_id.borrow().as_deref() == Some(crate::local_files::PAGE_ID) {
+            return;
+        }
         let local = self.playlist_id.borrow().as_deref().is_some_and(crate::local_library::is_local);
         self.more_menu.append(Some("Add all to Playlist…"), Some("page.show_add_all_to_playlist"));
         if self.ctx.online.is_online() && (self.audio_playlist_id.borrow().is_some() || self.playlist_id.borrow().is_some()) {
@@ -2170,7 +2173,7 @@ impl PlaylistPage {
     /// Neither number rides along on a track: fetch it once per playlist,
     /// then reorder when it lands.
     fn fetch_sort_metric(self: &Rc<Self>, sort_type: u32) {
-        let Some(pid) = self.playlist_id().filter(|p| p != "DOWNLOADS" && p != "HISTORY") else {
+        let Some(pid) = self.playlist_id().filter(|p| p != "DOWNLOADS" && p != crate::local_files::PAGE_ID && p != "HISTORY") else {
             self.sort_metric_unavailable(sort_type, false);
             return;
         };
@@ -2384,6 +2387,10 @@ impl PlaylistPage {
             self.show_downloads();
             return;
         }
+        if pid == crate::local_files::PAGE_ID {
+            self.show_local_files();
+            return;
+        }
         if pid == "HISTORY" {
             toast(&self.stack, "History requires an internet connection");
             return;
@@ -2415,6 +2422,24 @@ impl PlaylistPage {
         let tracks: Vec<Track> = self.ctx.downloads.all().iter().map(|entry| entry.track()).collect();
         let meta = format!("{} {} available offline", tracks.len(), if tracks.len() == 1 { "song" } else { "songs" });
         self.show_virtual("Downloaded Songs", tracks, &meta);
+    }
+
+    pub fn show_local_files(self: &Rc<Self>) {
+        let Some(folder) = crate::local_files::folder(&self.ctx.paths) else {
+            self.show_virtual("Local Files", Vec::new(), "Choose a folder in Preferences, General, Local Files");
+            return;
+        };
+        let cache = self.ctx.paths.cache_dir.clone();
+        let shown = folder.display().to_string();
+        let handle = self.ctx.net.spawn(async move { tokio::task::spawn_blocking(move || crate::local_files::scan(&folder, &cache)).await });
+        let weak = Rc::downgrade(self);
+        glib::spawn_future_local(async move {
+            let tracks = handle.await.ok().and_then(Result::ok).unwrap_or_default();
+            let Some(page) = weak.upgrade() else { return };
+            let meta = format!("{} {} in {shown}", tracks.len(), if tracks.len() == 1 { "song" } else { "songs" });
+            page.show_virtual("Local Files", tracks, &meta);
+            page.sel_add_btn.set_visible(false);
+        });
     }
 
     /// Port of _reshow_virtual and _fill_downloads_page.

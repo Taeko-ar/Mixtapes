@@ -25,6 +25,8 @@ use gtk::glib;
 
 const STREAM_RETRY_MAX: u8 = 2;
 
+pub const CROSSFADE_DEFAULT_SECONDS: f64 = 5.0;
+
 /// `history_mode`, the pref both apps read: when a play is recorded.
 const HISTORY_IMMEDIATE: &str = "immediate";
 const HISTORY_AFTER_30S: &str = "after_30s";
@@ -169,6 +171,12 @@ pub struct Player {
 
 impl Player {
     pub fn new(net: NetHandle, downloads: Arc<Downloads>, local: Arc<LocalLibrary>, audio: AudioHandle, events: AudioEvents, paths: &Paths) -> Rc<Self> {
+        {
+            let prefs = paths.read_prefs();
+            let on = prefs.get("crossfade_enabled").and_then(|v| v.as_bool()).unwrap_or(false);
+            let seconds = prefs.get("crossfade_seconds").and_then(|v| v.as_f64()).unwrap_or(CROSSFADE_DEFAULT_SECONDS);
+            audio.send(AudioCommand::SetCrossfade(if on { seconds } else { 0.0 }));
+        }
         Rc::new_cyclic(|me| Self {
             me: me.clone(),
             downloads,
@@ -231,7 +239,7 @@ impl Player {
             .flat_map(|step| [current.checked_add(step), current.checked_sub(step)])
             .flatten()
             .filter_map(|i| tracks.get(i))
-            .filter(|t| !t.video_id.0.is_empty() && !t.is_upload() && !self.downloads.is_downloaded(&t.video_id.0))
+            .filter(|t| !t.video_id.0.is_empty() && !t.is_upload() && !self.downloads.is_downloaded(&t.video_id.0) && !crate::local_files::is_file_id(&t.video_id.0))
             .map(|t| t.video_id.clone())
             .collect();
         if wanted.is_empty() {
@@ -252,7 +260,7 @@ impl Player {
     /// leaves Discord's art caption and the scrobble's album blank. The watch
     /// panel knows it, so it is asked once per play, off the hot path.
     fn backfill_album(&self, track: &Track) {
-        if track.album.is_some() || track.video_id.0.is_empty() || track.is_upload() || track.video_id.0.starts_with("demo:") {
+        if track.album.is_some() || track.video_id.0.is_empty() || track.is_upload() || track.video_id.0.starts_with("demo:") || crate::local_files::is_file_id(&track.video_id.0) {
             return;
         }
         let api = self.net.client().api();
@@ -281,6 +289,10 @@ impl Player {
             self.apply_track_metadata(Some(&current));
             self.emit_play(PlayEvent::Refined(current));
         }
+    }
+
+    pub fn set_crossfade(&self, seconds: f64) {
+        self.audio.send(AudioCommand::SetCrossfade(seconds));
     }
 
     /// Change when plays are written to the account's history, live.
@@ -450,6 +462,9 @@ impl Player {
     /// `set_like_status` from a row that holds the track: a song liked off
     /// the queue is known by nothing else here.
     pub fn rate(&self, video_id: VideoId, status: LikeStatus, known: Option<Track>) {
+        if crate::local_files::is_file_id(video_id.as_str()) {
+            return;
+        }
         let known = self.queue.borrow().tracks().iter().find(|t| t.video_id == video_id).cloned().or(known);
         if status == LikeStatus::Like && self.download_liked.get() {
             self.download_liked_track(&video_id, known.clone());
@@ -894,7 +909,8 @@ impl Player {
     /// Resolve `track` on the runtime; on success either load it or arm it for gapless.
     fn spawn_resolve(&self, track: Track, generation: u64, arm_only: bool) {
         // A downloaded file needs no resolve and plays offline.
-        if let Some(uri) = self.downloads.local_path(track.video_id.as_str()).and_then(|p| glib::filename_to_uri(&p, None).ok()) {
+        let on_disk = self.downloads.local_path(track.video_id.as_str()).or_else(|| crate::local_files::path(track.video_id.as_str()));
+        if let Some(uri) = on_disk.and_then(|p| glib::filename_to_uri(&p, None).ok()) {
             tracing::debug!(video_id = %track.video_id, "playing the downloaded file");
             if !arm_only {
                 *self.loaded.borrow_mut() = Some(StreamInfo { uri: uri.to_string(), is_local: true, ..StreamInfo::default() });
@@ -903,6 +919,18 @@ impl Player {
                 true if self.armed_next.borrow().as_ref().is_some_and(|a| a.generation == generation) => self.audio.send(AudioCommand::ArmNext { uri: uri.to_string(), generation, auth: None }),
                 true => {}
                 false => self.audio.send(AudioCommand::Load { uri: uri.to_string(), generation, auth: None }),
+            }
+            return;
+        }
+        if crate::local_files::is_file_id(track.video_id.as_str()) {
+            if !arm_only {
+                self.state.emit_track_error(track.video_id.as_str(), &track.title, "File not found");
+                let weak = self.weak_self();
+                glib::idle_add_local_once(move || {
+                    if let Some(player) = weak.upgrade().filter(|p| p.current.get() == generation) {
+                        player.advance_after_failure();
+                    }
+                });
             }
             return;
         }
@@ -1072,7 +1100,7 @@ impl Player {
         let next = {
             let q = self.queue.borrow();
             let from = q.current().map_or(0, |i| i + 1);
-            (from..q.len()).find(|i| q.track_at(*i).is_some_and(|t| self.downloads.is_downloaded(t.video_id.as_str())))
+            (from..q.len()).find(|i| q.track_at(*i).is_some_and(|t| self.downloads.is_downloaded(t.video_id.as_str()) || crate::local_files::path(t.video_id.as_str()).is_some()))
         };
         match next {
             Some(index) => {
@@ -1552,7 +1580,7 @@ impl Player {
     /// "immediate" as the track loads, "after_30s" once it has played that
     /// long, "never" not at all.
     fn record_play(&self, video_id: &str) {
-        if video_id.is_empty() || self.history_mode.borrow().as_str() == HISTORY_NEVER {
+        if video_id.is_empty() || crate::local_files::is_file_id(video_id) || self.history_mode.borrow().as_str() == HISTORY_NEVER {
             return;
         }
         // A demo run plays whatever the test needs. That is not the listener's history,

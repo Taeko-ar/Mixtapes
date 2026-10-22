@@ -10,7 +10,6 @@ use std::rc::Rc;
 use adw::prelude::*;
 use gtk::{gdk, glib};
 
-use crate::model::RepeatMode;
 use crate::player::Player;
 use crate::state::QueueEntry;
 use crate::ui::context::UiContext;
@@ -108,57 +107,6 @@ impl QueuePanel {
         title_row.append(&controls_end);
         header_bar.set_title_widget(Some(&title_row));
 
-        let shuffle_btn = gtk::ToggleButton::builder()
-            .icon_name("media-playlist-shuffle-symbolic")
-            .tooltip_text("Shuffle Queue")
-            .build();
-        state
-            .bind_property("shuffle", &shuffle_btn, "active")
-            .sync_create()
-            .build();
-        // Toggle the class like _update_shuffle_state: replacing css-classes wholesale
-        // strips the button styles the header bar gave it.
-        {
-            let btn = shuffle_btn.clone();
-            let sync = move |on: bool| {
-                if on {
-                    btn.add_css_class("accent")
-                } else {
-                    btn.remove_css_class("accent")
-                }
-            };
-            sync(state.shuffle());
-            state.connect_notify_local(Some("shuffle"), move |s, _| sync(s.shuffle()));
-        }
-
-        let repeat_btn = gtk::Button::builder()
-            .icon_name("media-playlist-consecutive-symbolic")
-            .tooltip_text("Repeat Mode")
-            .build();
-        state
-            .bind_property("repeat", &repeat_btn, "icon-name")
-            .transform_to(|_, mode: RepeatMode| {
-                Some(match mode {
-                    RepeatMode::Track => "media-playlist-repeat-song-symbolic",
-                    RepeatMode::All => "media-playlist-repeat-symbolic",
-                    RepeatMode::Off => "media-playlist-consecutive-symbolic",
-                })
-            })
-            .sync_create()
-            .build();
-        {
-            let btn = repeat_btn.clone();
-            let sync = move |mode: RepeatMode| {
-                if mode == RepeatMode::Off {
-                    btn.remove_css_class("accent")
-                } else {
-                    btn.add_css_class("accent")
-                }
-            };
-            sync(state.repeat());
-            state.connect_notify_local(Some("repeat"), move |s, _| sync(s.repeat()));
-        }
-
         let add_btn = gtk::Button::builder()
             .icon_name("list-add-symbolic")
             .tooltip_text("Add all to Playlist")
@@ -171,10 +119,6 @@ impl QueuePanel {
         // -- bottom bar --------------------------------------------------
         // Every queue action sits here: close to the player bar with a mouse, in reach on a tall phone.
         let actions = gtk::CenterBox::builder().css_classes(["toolbar", "queue-actions"]).build();
-        let playback = gtk::Box::builder().spacing(6).build();
-        playback.append(&shuffle_btn);
-        playback.append(&repeat_btn);
-        actions.set_start_widget(Some(&playback));
         let edits = gtk::Box::builder().spacing(6).build();
         edits.append(&add_btn);
         edits.append(&clear_btn);
@@ -299,21 +243,6 @@ impl QueuePanel {
             });
         }
 
-        {
-            let player = player.clone();
-            shuffle_btn.connect_clicked(move |_| player.toggle_shuffle());
-        }
-        {
-            let player = player.clone();
-            repeat_btn.connect_clicked(move |_| {
-                let next = match player.repeat_mode() {
-                    RepeatMode::Off => RepeatMode::All,
-                    RepeatMode::All => RepeatMode::Track,
-                    RepeatMode::Track => RepeatMode::Off,
-                };
-                player.set_repeat(next);
-            });
-        }
         {
             let player = player.clone();
             clear_btn.connect_clicked(move |_| player.clear_queue());
@@ -542,6 +471,15 @@ impl QueuePanel {
         info.append(&artist);
         row.append(&info);
 
+        let remove_btn = gtk::Button::builder()
+            .icon_name("window-close-symbolic")
+            .tooltip_text("Remove from Queue")
+            .valign(gtk::Align::Center)
+            .css_classes(["flat", "circular", "dim-label"])
+            .margin_end(4)
+            .build();
+        row.append(&remove_btn);
+
         entry
             .chain_property::<QueueEntry>("title")
             .bind(&title, "label", gtk::Widget::NONE);
@@ -611,14 +549,29 @@ impl QueuePanel {
             row.connect_destroy(move |_| watch.unwatch());
         }
 
+        {
+            let entry_of = entry_of.clone();
+            let player = self.player.clone();
+            remove_btn.connect_clicked(move |_| {
+                if let Some(entry) = entry_of() {
+                    player.remove_from_queue(entry.index() as usize);
+                }
+            });
+        }
+
         // Left click plays the row unless it is already current.
         {
             let entry_of = entry_of.clone();
             let player = self.player.clone();
+            let (row_c, handle_c, remove_c) = (row.clone(), handle.clone(), remove_btn.clone());
             let click = gtk::GestureClick::builder()
                 .button(gdk::BUTTON_PRIMARY)
                 .build();
-            click.connect_released(move |_, _, _, _| {
+            click.connect_released(move |_, _, x, y| {
+                let target = row_c.pick(x, y, gtk::PickFlags::DEFAULT);
+                if target.is_some_and(|w| w == handle_c || w == remove_c || w.is_ancestor(&remove_c)) {
+                    return;
+                }
                 if let Some(entry) = entry_of() {
                     if entry.index() as i32 != player.state().current_index() {
                         player.play_queue_index(entry.index() as usize);

@@ -193,7 +193,7 @@ impl Downloads {
 
     fn queue_one(self: &Arc<Self>, track: Track, album_id: &str, track_number: Option<u32>) {
         let (video_id, title) = (track.video_id.0.clone(), track.title.clone());
-        if video_id.is_empty() || self.is_downloaded(&video_id) {
+        if video_id.is_empty() || crate::local_files::is_file_id(&video_id) || self.is_downloaded(&video_id) {
             return;
         }
         {

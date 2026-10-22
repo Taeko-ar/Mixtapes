@@ -9,7 +9,7 @@ use std::time::{Duration, Instant};
 
 use gtk::{gdk, glib, prelude::*};
 
-use crate::model::{LikeStatus, PlaybackStatus, VideoId};
+use crate::model::{LikeStatus, PlaybackStatus, RepeatMode, VideoId};
 use crate::net::NetHandle;
 use crate::player::Player;
 use crate::state::PlayerState;
@@ -52,6 +52,7 @@ pub struct PlayerBar {
     play_icon: gtk::Image,
     next_btn: gtk::Button,
     volume_container: gtk::Box,
+    playback_box: gtk::Box,
     volume_btn: gtk::Button,
     volume_scale: gtk::Scale,
     queue_btn: gtk::ToggleButton,
@@ -202,6 +203,82 @@ impl PlayerBar {
         volume_container.add_controller(hover);
         controls_box.append(&volume_container);
 
+        let state = player.state();
+        let shuffle_btn = gtk::ToggleButton::builder()
+            .icon_name("media-playlist-shuffle-symbolic")
+            .css_classes(["flat"])
+            .valign(gtk::Align::Center)
+            .tooltip_text("Shuffle Queue")
+            .build();
+        state
+            .bind_property("shuffle", &shuffle_btn, "active")
+            .sync_create()
+            .build();
+        // Toggle the class like _update_shuffle_state: replacing css-classes wholesale
+        // strips the button styles the header bar gave it.
+        {
+            let btn = shuffle_btn.clone();
+            let sync = move |on: bool| {
+                if on {
+                    btn.add_css_class("accent")
+                } else {
+                    btn.remove_css_class("accent")
+                }
+            };
+            sync(state.shuffle());
+            state.connect_notify_local(Some("shuffle"), move |s, _| sync(s.shuffle()));
+        }
+
+        let repeat_btn = gtk::Button::builder()
+            .icon_name("media-playlist-consecutive-symbolic")
+            .css_classes(["flat"])
+            .valign(gtk::Align::Center)
+            .tooltip_text("Repeat Mode")
+            .build();
+        state
+            .bind_property("repeat", &repeat_btn, "icon-name")
+            .transform_to(|_, mode: RepeatMode| {
+                Some(match mode {
+                    RepeatMode::Track => "media-playlist-repeat-song-symbolic",
+                    RepeatMode::All => "media-playlist-repeat-symbolic",
+                    RepeatMode::Off => "media-playlist-consecutive-symbolic",
+                })
+            })
+            .sync_create()
+            .build();
+        {
+            let btn = repeat_btn.clone();
+            let sync = move |mode: RepeatMode| {
+                if mode == RepeatMode::Off {
+                    btn.remove_css_class("accent")
+                } else {
+                    btn.add_css_class("accent")
+                }
+            };
+            sync(state.repeat());
+            state.connect_notify_local(Some("repeat"), move |s, _| sync(s.repeat()));
+        }
+
+        {
+            let player = player.clone();
+            shuffle_btn.connect_clicked(move |_| player.toggle_shuffle());
+        }
+        {
+            let player = player.clone();
+            repeat_btn.connect_clicked(move |_| {
+                let next = match player.repeat_mode() {
+                    RepeatMode::Off => RepeatMode::All,
+                    RepeatMode::All => RepeatMode::Track,
+                    RepeatMode::Track => RepeatMode::Off,
+                };
+                player.set_repeat(next);
+            });
+        }
+        let playback_box = gtk::Box::builder().valign(gtk::Align::Center).build();
+        playback_box.append(&shuffle_btn);
+        playback_box.append(&repeat_btn);
+        controls_box.append(&playback_box);
+
         // Like sits before the queue toggle, the order the expanded player uses.
         let like = LikeButton::new(player.clone());
         like.widget().remove_css_class("circular");
@@ -253,6 +330,7 @@ impl PlayerBar {
             play_icon,
             next_btn,
             volume_container,
+            playback_box,
             volume_btn,
             volume_scale,
             queue_btn,
@@ -804,6 +882,7 @@ impl PlayerBar {
     fn responsive_order(&self) -> Vec<gtk::Widget> {
         vec![
             self.volume_container.clone().upcast(),
+            self.playback_box.clone().upcast(),
             self.like.widget().clone().upcast(),
             self.queue_btn.clone().upcast(),
         ]
@@ -820,7 +899,8 @@ impl PlayerBar {
         }
         self.last_responsive_width.set(width);
 
-        let candidates: [(gtk::Widget, bool); 3] = [
+        let candidates: [(gtk::Widget, bool); 4] = [
+            (self.playback_box.clone().upcast(), width >= 800),
             (self.like.widget().clone().upcast(), width >= 720),
             (self.queue_btn.clone().upcast(), width >= 640),
             (self.volume_container.clone().upcast(), width >= 560),

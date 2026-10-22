@@ -1102,7 +1102,7 @@ impl MainWindow {
     /// Port of _resolve_artist_from_player: the playing track's channel, from its song details.
     fn resolve_artist_from_player(self: &Rc<Self>) {
         let vid = self.ui.player.state().video_id();
-        if vid.is_empty() {
+        if vid.is_empty() || crate::local_files::is_file_id(&vid) {
             return;
         }
         let api = self.ui.net.client().api();
@@ -1117,6 +1117,25 @@ impl MainWindow {
                 w.open_artist(&channel, Some(&author));
             }
         });
+    }
+
+    pub fn open_local_files(self: &Rc<Self>) {
+        let page = PlaylistPage::new(self.ui.clone());
+        page.prepare_virtual(crate::local_files::PAGE_ID);
+        let nav_page = adw::NavigationPage::builder().child(page.widget()).title("Local Files").build();
+        let weak = Rc::downgrade(self);
+        page.set_on_header_title(move |title| {
+            if let Some(w) = weak.upgrade() {
+                w.title_widget.set_title(if title.is_empty() { APP_NAME } else { title });
+            }
+        });
+        let page_c = page.clone();
+        nav_page.connect_shown(move |_| {
+            let page = page_c.clone();
+            glib::idle_add_local_once(move || page.show_local_files());
+        });
+        unsafe { nav_page.set_data("pushed", PushedPage::Playlist(page)) };
+        self.push_page(nav_page);
     }
 
     /// Port of _open_downloads_from_menu: a playlist page over the download library.
@@ -2704,6 +2723,18 @@ fn install_actions(
             Box::new(move || {
                 if let Some(win) = ctx.window.borrow().as_ref() {
                     win.open_downloads();
+                }
+            }),
+        );
+    }
+    {
+        let ctx = ctx.clone();
+        add(
+            "open-local-files",
+            true,
+            Box::new(move || {
+                if let Some(win) = ctx.window.borrow().as_ref() {
+                    win.open_local_files();
                 }
             }),
         );

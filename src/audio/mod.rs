@@ -11,12 +11,12 @@
 //! newest-wins). Every event is stamped with the load generation it belongs
 //! to so the controller can drop anything stale.
 
-use std::cell::Cell;
-use std::rc::Rc;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::cell::{Cell, RefCell};
+use std::rc::{Rc, Weak};
+use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use async_channel::{Receiver, Sender};
 use gst::prelude::*;
@@ -29,6 +29,7 @@ const POSITION_TICK: Duration = Duration::from_millis(100);
 const SPECTRUM_BANDS: u32 = 128;
 const SPECTRUM_THRESHOLD_DB: i32 = -80;
 const SPECTRUM_INTERVAL_NS: u64 = 33_000_000;
+const FADE_STEP: Duration = Duration::from_millis(20);
 
 #[derive(Debug)]
 pub enum AudioCommand {
@@ -47,6 +48,7 @@ pub enum AudioCommand {
     Describe { reply: async_channel::Sender<String> },
     SetVolume(f64),
     SetMute(bool),
+    SetCrossfade(f64),
     Shutdown,
 }
 
@@ -128,6 +130,7 @@ struct Shared {
     /// Set from a load until `restore_levels` has run. The new sink reports
     /// its own defaults first, and passing those on flicked the slider to full.
     levels_settling: std::sync::atomic::AtomicBool,
+    crossfade_ms: AtomicU32,
 }
 
 /// A live HLS playlist, by its address. The queue's track may not know it is live.
@@ -135,10 +138,27 @@ pub fn is_live_uri(uri: &str) -> bool {
     uri.contains("/manifest/hls_") || uri.split('?').next().is_some_and(|path| path.ends_with(".m3u8"))
 }
 
-struct Engine {
+struct Deck {
     playbin: gst::Element,
     /// The sink playbin plays into, held so its remembered device can be cleared.
     audio_sink: Option<gst::Element>,
+    fade: gst::Element,
+}
+
+struct Fade {
+    id: u64,
+    out: usize,
+    dur: Duration,
+    started: Option<Instant>,
+}
+
+struct Engine {
+    decks: [Deck; 2],
+    active: Cell<usize>,
+    fade: RefCell<Option<Fade>>,
+    fade_ids: Cell<u64>,
+    ctx: glib::MainContext,
+    me: RefCell<Weak<Engine>>,
     shared: Arc<Shared>,
     control: Sender<AudioEvent>,
     telemetry: Sender<AudioTelemetry>,
@@ -161,17 +181,21 @@ fn run_loop(
     let ctx = glib::MainContext::new();
     let main_loop = glib::MainLoop::new(Some(&ctx), false);
 
-    let setup = ctx.with_thread_default(|| -> anyhow::Result<(Rc<Engine>, gst::bus::BusWatchGuard)> {
-        let engine = Rc::new(Engine::build(control, telemetry, main_loop.clone())?);
+    let setup = ctx.with_thread_default(|| -> anyhow::Result<(Rc<Engine>, Vec<gst::bus::BusWatchGuard>)> {
+        let engine = Rc::new(Engine::build(control, telemetry, main_loop.clone(), ctx.clone())?);
+        *engine.me.borrow_mut() = Rc::downgrade(&engine);
 
-        let bus = engine.playbin.bus().expect("playbin has a bus");
-        let watch = {
+        let mut watches = Vec::with_capacity(2);
+        for index in 0..2 {
+            let bus = engine.decks[index].playbin.bus().expect("playbin has a bus");
             let engine = engine.clone();
-            bus.add_watch_local(move |_, msg| {
-                engine.on_message(msg);
+            watches.push(bus.add_watch_local(move |_, msg| {
+                if engine.active.get() == index {
+                    engine.on_message(msg);
+                }
                 glib::ControlFlow::Continue
-            })?
-        };
+            })?);
+        }
 
         // timeout_add_local targets the global default context, which is the GTK
         // thread. Build the source by hand and attach it to this thread's context.
@@ -196,7 +220,7 @@ fn run_loop(
             });
         }
 
-        Ok((engine, watch))
+        Ok((engine, watches))
     });
 
     let (engine, _watch) = match setup {
@@ -214,9 +238,11 @@ fn run_loop(
         }
     };
 
-    engine.emit(AudioEvent::VolumeChanged { volume: cubic_volume(&engine.playbin), muted: engine.playbin.property::<bool>("mute") });
+    engine.emit(AudioEvent::VolumeChanged { volume: cubic_volume(engine.playbin()), muted: engine.playbin().property::<bool>("mute") });
     main_loop.run();
-    let _ = engine.playbin.set_state(gst::State::Null);
+    for deck in &engine.decks {
+        let _ = deck.playbin.set_state(gst::State::Null);
+    }
     tracing::info!("audio thread exited");
 }
 
@@ -266,8 +292,8 @@ fn set_download_buffering(playbin: &gst::Element, uri: &str) {
 }
 
 impl Engine {
-    fn build(control: Sender<AudioEvent>, telemetry: Sender<AudioTelemetry>, main_loop: glib::MainLoop) -> anyhow::Result<Self> {
-        let playbin = gst::ElementFactory::make("playbin").name("player").build()?;
+    fn make_deck(shared: &Arc<Shared>, control: &Sender<AudioEvent>, index: usize) -> anyhow::Result<Deck> {
+        let playbin = gst::ElementFactory::make("playbin").name(format!("player{index}")).build()?;
 
         // Audio only: clear the video flag so no window ever pops up.
         let flags = playbin.property_value("flags");
@@ -277,9 +303,10 @@ impl Engine {
             }
         }
 
-        // Passthrough spectrum analyzer feeding the visualizer.
+        let fade = gst::ElementFactory::make("volume").name(format!("fade{index}")).build()?;
+        let mut chain = vec![fade.clone()];
         match gst::ElementFactory::make("spectrum")
-            .name("visualizer-spectrum")
+            .name(format!("visualizer-spectrum{index}"))
             .property("post-messages", true)
             .property("message-magnitude", true)
             .property("message-phase", false)
@@ -289,9 +316,17 @@ impl Engine {
             .property("multi-channel", false)
             .build()
         {
-            Ok(spectrum) => playbin.set_property("audio-filter", &spectrum),
+            Ok(spectrum) => chain.push(spectrum),
             Err(err) => tracing::warn!(%err, "spectrum element unavailable; visualizer stays inert"),
         }
+        let filter = gst::Bin::builder().name(format!("audio-filter{index}")).build();
+        filter.add_many(&chain)?;
+        gst::Element::link_many(&chain)?;
+        let first = chain.first().and_then(|e| e.static_pad("sink")).ok_or_else(|| anyhow::anyhow!("fade stage has no sink pad"))?;
+        let last = chain.last().and_then(|e| e.static_pad("src")).ok_or_else(|| anyhow::anyhow!("filter chain has no src pad"))?;
+        filter.add_pad(&gst::GhostPad::builder_with_target(&first)?.name("sink").build())?;
+        filter.add_pad(&gst::GhostPad::builder_with_target(&last)?.name("src").build())?;
+        playbin.set_property("audio-filter", &filter);
 
         // Our own sink, so `clear_remembered_device` has something to reach.
         // What playbin would have built on its own is this same element.
@@ -308,15 +343,6 @@ impl Engine {
                 None
             }
         };
-
-        let shared = Arc::new(Shared {
-            generation: AtomicU64::new(0),
-            armed_next: Mutex::new(None),
-            pending_gapless: Mutex::new(None),
-            http_auth: Mutex::new(None),
-            live: std::sync::atomic::AtomicBool::new(false),
-            levels_settling: std::sync::atomic::AtomicBool::new(false),
-        });
 
         // Streaming thread: push cookies and UA onto every HTTP request the source makes.
         {
@@ -337,6 +363,9 @@ impl Engine {
             playbin.connect("about-to-finish", false, move |values| {
                 let Ok(playbin) = values[0].get::<gst::Element>() else { return None };
                 if shared.live.load(Ordering::Acquire) {
+                    return None;
+                }
+                if shared.crossfade_ms.load(Ordering::Acquire) > 0 {
                     return None;
                 }
                 let armed = shared.armed_next.lock().unwrap().take();
@@ -369,9 +398,27 @@ impl Engine {
             playbin.connect_notify(Some("mute"), notify);
         }
 
+        Ok(Deck { playbin, audio_sink, fade })
+    }
+
+    fn build(control: Sender<AudioEvent>, telemetry: Sender<AudioTelemetry>, main_loop: glib::MainLoop, ctx: glib::MainContext) -> anyhow::Result<Self> {
+        let shared = Arc::new(Shared {
+            generation: AtomicU64::new(0),
+            armed_next: Mutex::new(None),
+            pending_gapless: Mutex::new(None),
+            http_auth: Mutex::new(None),
+            live: std::sync::atomic::AtomicBool::new(false),
+            levels_settling: std::sync::atomic::AtomicBool::new(false),
+            crossfade_ms: AtomicU32::new(0),
+        });
+        let decks = [Self::make_deck(&shared, &control, 0)?, Self::make_deck(&shared, &control, 1)?];
         Ok(Self {
-            playbin,
-            audio_sink,
+            decks,
+            active: Cell::new(0),
+            fade: RefCell::new(None),
+            fade_ids: Cell::new(0),
+            ctx,
+            me: RefCell::new(Weak::new()),
             shared,
             control,
             telemetry,
@@ -383,17 +430,112 @@ impl Engine {
         })
     }
 
+    fn playbin(&self) -> &gst::Element {
+        &self.decks[self.active.get()].playbin
+    }
+
+    fn swap_decks(&self, dur: Duration) {
+        let out = self.active.get();
+        self.decks[out].fade.set_property("volume", 1.0_f64);
+        self.decks[1 - out].fade.set_property("volume", 0.0_f64);
+        self.active.set(1 - out);
+        let id = self.fade_ids.get() + 1;
+        self.fade_ids.set(id);
+        *self.fade.borrow_mut() = Some(Fade { id, out, dur, started: None });
+    }
+
+    fn begin_ramp(&self) {
+        let id = {
+            let mut fade = self.fade.borrow_mut();
+            let Some(fade) = fade.as_mut().filter(|f| f.started.is_none()) else { return };
+            fade.started = Some(Instant::now());
+            fade.id
+        };
+        let Some(me) = self.me.borrow().upgrade() else {
+            self.end_fade();
+            return;
+        };
+        let me = glib::thread_guard::ThreadGuard::new(me);
+        let step = glib::timeout_source_new(FADE_STEP, Some("mixtapes-fade"), glib::Priority::DEFAULT, move || me.get_ref().fade_step(id));
+        step.attach(Some(&self.ctx));
+    }
+
+    fn fade_step(&self, id: u64) -> glib::ControlFlow {
+        let (out, t) = {
+            let fade = self.fade.borrow();
+            let Some(fade) = fade.as_ref().filter(|f| f.id == id) else { return glib::ControlFlow::Break };
+            let Some(started) = fade.started else { return glib::ControlFlow::Break };
+            (fade.out, (started.elapsed().as_secs_f64() / fade.dur.as_secs_f64()).min(1.0))
+        };
+        let angle = t * std::f64::consts::FRAC_PI_2;
+        self.decks[out].fade.set_property("volume", angle.cos());
+        self.decks[self.active.get()].fade.set_property("volume", angle.sin());
+        if t >= 1.0 {
+            self.end_fade();
+            return glib::ControlFlow::Break;
+        }
+        glib::ControlFlow::Continue
+    }
+
+    fn end_fade(&self) {
+        let Some(fade) = self.fade.borrow_mut().take() else { return };
+        let out = &self.decks[fade.out];
+        let _ = out.playbin.set_state(gst::State::Null);
+        out.fade.set_property("volume", 1.0_f64);
+        self.decks[self.active.get()].fade.set_property("volume", 1.0_f64);
+    }
+
+    fn fade_for_load(&self, uri: &str) -> Option<Duration> {
+        let ms = self.shared.crossfade_ms.load(Ordering::Acquire);
+        if ms == 0 || self.fade.borrow().is_some() || self.loading.get() || self.shared.live.load(Ordering::Acquire) || is_live_uri(uri) {
+            return None;
+        }
+        let (_, state, _) = self.playbin().state(gst::ClockTime::ZERO);
+        if state != gst::State::Playing {
+            return None;
+        }
+        let mut secs = f64::from(ms) / 1000.0;
+        let position = self.playbin().query_position::<gst::ClockTime>()?;
+        if let Some(duration) = self.playbin().query_duration::<gst::ClockTime>().filter(|d| !d.is_zero()) {
+            secs = secs.min((duration.seconds_f64() - position.seconds_f64()).max(0.0));
+        }
+        (secs >= 0.2).then(|| Duration::from_secs_f64(secs))
+    }
+
+    fn crossfade_into_armed(&self, secs: f64) {
+        let Some((uri, generation)) = self.shared.armed_next.lock().unwrap().take() else { return };
+        let out = self.active.get();
+        self.swap_decks(Duration::from_secs_f64(secs));
+        *self.shared.pending_gapless.lock().unwrap() = Some(generation);
+        self.loading.set(true);
+        self.shared.levels_settling.store(true, Ordering::Release);
+        self.clear_remembered_device();
+        let incoming = self.playbin();
+        set_download_buffering(incoming, &uri);
+        incoming.set_property("uri", &uri);
+        tracing::debug!(generation, secs, "crossfade: next track on the idle deck");
+        if let Err(err) = incoming.set_state(gst::State::Playing) {
+            tracing::warn!(%err, "crossfade could not start");
+            let _ = incoming.set_state(gst::State::Null);
+            *self.fade.borrow_mut() = None;
+            self.active.set(out);
+            *self.shared.pending_gapless.lock().unwrap() = None;
+            self.loading.set(false);
+            self.release_levels();
+        }
+    }
+
     /// Put back the mute and volume the listener chose, where the sink a load
     /// just built came up with its own. Only a difference is written, so a
     /// sink that kept them sees nothing.
     fn restore_levels(&self) {
         if let Some(muted) = self.wanted_mute.get() {
-            if self.playbin.property::<bool>("mute") != muted {
+            if self.playbin().property::<bool>("mute") != muted {
                 tracing::debug!(muted, "new sink came up with another mute, restoring");
-                self.playbin.set_property("mute", muted);
+                self.playbin().set_property("mute", muted);
             }
         }
-        if let (Some(volume), Some(sv)) = (self.wanted_volume.get(), self.playbin.dynamic_cast_ref::<gst_audio::StreamVolume>()) {
+        if let (Some(volume), Some(sv)) = (self.wanted_volume.get(), self.playbin().dynamic_cast_ref::<gst_audio::StreamVolume>()) {
             if (sv.volume(gst_audio::StreamVolumeFormat::Cubic) - volume).abs() > 1e-3 {
                 tracing::debug!(volume, "new sink came up with another volume, restoring");
                 sv.set_volume(gst_audio::StreamVolumeFormat::Cubic, volume);
@@ -406,7 +548,7 @@ impl Engine {
     /// stands now, so the slider moves once, to the right place.
     fn release_levels(&self) {
         if self.shared.levels_settling.swap(false, Ordering::AcqRel) {
-            self.emit(AudioEvent::VolumeChanged { volume: cubic_volume(&self.playbin), muted: self.playbin.property::<bool>("mute") });
+            self.emit(AudioEvent::VolumeChanged { volume: cubic_volume(&self.playbin()), muted: self.playbin().property::<bool>("mute") });
         }
     }
 
@@ -431,17 +573,17 @@ impl Engine {
     /// refused even with seekable true.
     fn describe(&self) -> String {
         let mut lines = Vec::new();
-        let (_, state, _) = self.playbin.state(gst::ClockTime::ZERO);
+        let (_, state, _) = self.playbin().state(gst::ClockTime::ZERO);
         lines.push(format!("State:      {state:?}"));
-        let source: Option<gst::Element> = self.playbin.property("source");
+        let source: Option<gst::Element> = self.playbin().property("source");
         let factory = source.and_then(|s| s.factory().map(|f| f.name().to_string()));
         lines.push(format!("Src elem:   {}", factory.unwrap_or_else(|| "unknown".to_owned())));
-        let position = self.playbin.query_position::<gst::ClockTime>();
-        let duration = self.playbin.query_duration::<gst::ClockTime>();
+        let position = self.playbin().query_position::<gst::ClockTime>();
+        let duration = self.playbin().query_duration::<gst::ClockTime>();
         lines.push(format!("Position:   {}", clock(position)));
         lines.push(format!("Duration:   {}", clock(duration)));
         let mut seeking = gst::query::Seeking::new(gst::Format::Time);
-        if self.playbin.query(&mut seeking) {
+        if self.playbin().query(&mut seeking) {
             let (seekable, start, end) = seeking.result();
             lines.push(format!("Seekable:   {seekable}"));
             let span = |value: gst::GenericFormattedValue| match value {
@@ -464,7 +606,7 @@ impl Engine {
     /// other app across and left this one on the speakers until it was
     /// restarted. A stream that asks for the default is moved with the rest.
     fn clear_remembered_device(&self) {
-        if let Some(sink) = &self.audio_sink {
+        if let Some(sink) = &self.decks[self.active.get()].audio_sink {
             clear_device(sink);
         }
     }
@@ -473,6 +615,10 @@ impl Engine {
         match cmd {
             AudioCommand::Load { uri, generation, auth } => {
                 tracing::debug!(generation, "audio: load");
+                let fade = self.fade_for_load(&uri);
+                if fade.is_none() {
+                    self.end_fade();
+                }
                 self.shared.generation.store(generation, Ordering::Release);
                 *self.shared.armed_next.lock().unwrap() = None;
                 *self.shared.pending_gapless.lock().unwrap() = None;
@@ -482,12 +628,15 @@ impl Engine {
                 self.last_status.set(PlaybackStatus::Loading);
                 self.emit(AudioEvent::StateChanged { generation, status: PlaybackStatus::Loading });
                 self.shared.levels_settling.store(true, Ordering::Release);
+                if let Some(dur) = fade {
+                    self.swap_decks(dur);
+                }
                 // Null flushes the bus, so no message from the old stream survives this point.
-                let _ = self.playbin.set_state(gst::State::Null);
+                let _ = self.playbin().set_state(gst::State::Null);
                 self.clear_remembered_device();
-                set_download_buffering(&self.playbin, &uri);
-                self.playbin.set_property("uri", &uri);
-                if let Err(err) = self.playbin.set_state(gst::State::Playing) {
+                set_download_buffering(&self.playbin(), &uri);
+                self.playbin().set_property("uri", &uri);
+                if let Err(err) = self.playbin().set_state(gst::State::Playing) {
                     self.release_levels();
                     self.loading.set(false);
                     self.emit(AudioEvent::Error { generation, message: format!("could not start playback: {err}"), debug: None });
@@ -507,17 +656,19 @@ impl Engine {
                 *self.shared.armed_next.lock().unwrap() = None;
             }
             AudioCommand::Play => {
-                let _ = self.playbin.set_state(gst::State::Playing);
+                let _ = self.playbin().set_state(gst::State::Playing);
             }
             AudioCommand::Pause => {
-                let _ = self.playbin.set_state(gst::State::Paused);
+                self.end_fade();
+                let _ = self.playbin().set_state(gst::State::Paused);
             }
             AudioCommand::Stop => {
                 tracing::debug!(generation = self.generation(), "audio: stop");
+                self.end_fade();
                 *self.shared.armed_next.lock().unwrap() = None;
                 *self.shared.pending_gapless.lock().unwrap() = None;
                 self.loading.set(false);
-                let _ = self.playbin.set_state(gst::State::Null);
+                let _ = self.playbin().set_state(gst::State::Null);
                 self.release_levels();
                 self.set_status(PlaybackStatus::Stopped);
             }
@@ -525,8 +676,8 @@ impl Engine {
                 let target = gst::ClockTime::from_seconds_f64(seconds.max(0.0));
                 // Accurate first, like Player.seek. A key-unit seek lands on the
                 // previous keyframe or cluster, which is the jump back the user sees.
-                if self.playbin.seek_simple(gst::SeekFlags::FLUSH | gst::SeekFlags::ACCURATE, target).is_err() {
-                    if let Err(err) = self.playbin.seek_simple(gst::SeekFlags::FLUSH | gst::SeekFlags::KEY_UNIT, target) {
+                if self.playbin().seek_simple(gst::SeekFlags::FLUSH | gst::SeekFlags::ACCURATE, target).is_err() {
+                    if let Err(err) = self.playbin().seek_simple(gst::SeekFlags::FLUSH | gst::SeekFlags::KEY_UNIT, target) {
                         tracing::warn!(%err, seconds, "seek rejected by pipeline");
                     }
                 }
@@ -537,13 +688,21 @@ impl Engine {
             AudioCommand::SetVolume(v) => {
                 let v = v.clamp(0.0, 1.0);
                 self.wanted_volume.set(Some(v));
-                if let Some(sv) = self.playbin.dynamic_cast_ref::<gst_audio::StreamVolume>() {
-                    sv.set_volume(gst_audio::StreamVolumeFormat::Cubic, v);
+                for deck in &self.decks {
+                    if let Some(sv) = deck.playbin.dynamic_cast_ref::<gst_audio::StreamVolume>() {
+                        sv.set_volume(gst_audio::StreamVolumeFormat::Cubic, v);
+                    }
                 }
             }
             AudioCommand::SetMute(m) => {
                 self.wanted_mute.set(Some(m));
-                self.playbin.set_property("mute", m);
+                for deck in &self.decks {
+                    deck.playbin.set_property("mute", m);
+                }
+            }
+            AudioCommand::SetCrossfade(seconds) => {
+                let ms = (seconds.clamp(0.0, 10.0) * 1000.0).round() as u32;
+                self.shared.crossfade_ms.store(ms, Ordering::Release);
             }
             AudioCommand::Shutdown => return glib::ControlFlow::Break,
         }
@@ -552,7 +711,7 @@ impl Engine {
 
     fn on_message(&self, msg: &gst::Message) {
         use gst::MessageView;
-        let from_playbin = msg.src().map(|s| s == self.playbin.upcast_ref::<gst::Object>()).unwrap_or(false);
+        let from_playbin = msg.src().map(|s| s == self.playbin().upcast_ref::<gst::Object>()).unwrap_or(false);
         match msg.view() {
             MessageView::StreamStart(_) => {
                 let pending = self.shared.pending_gapless.lock().unwrap().take();
@@ -582,13 +741,15 @@ impl Engine {
                 tracing::warn!(generation, %message, "pipeline error");
                 self.release_levels();
                 self.loading.set(false);
-                let _ = self.playbin.set_state(gst::State::Null);
+                self.end_fade();
+                let _ = self.playbin().set_state(gst::State::Null);
                 self.emit(AudioEvent::Error { generation, message, debug });
                 self.set_status(PlaybackStatus::Stopped);
             }
             MessageView::StateChanged(s) if from_playbin => match s.current() {
                 gst::State::Playing => {
                     self.restore_levels();
+                    self.begin_ramp();
                     self.loading.set(false);
                     self.set_status(PlaybackStatus::Playing);
                 }
@@ -615,13 +776,23 @@ impl Engine {
         if self.loading.get() {
             return;
         }
-        let (_, state, _) = self.playbin.state(gst::ClockTime::ZERO);
+        let (_, state, _) = self.playbin().state(gst::ClockTime::ZERO);
         if !matches!(state, gst::State::Playing | gst::State::Paused) {
             return;
         }
-        let Some(position) = self.playbin.query_position::<gst::ClockTime>() else { return };
+        let Some(position) = self.playbin().query_position::<gst::ClockTime>() else { return };
         // Some upload streams report a zero duration; treat that as unknown.
-        let duration = self.playbin.query_duration::<gst::ClockTime>().filter(|d| !d.is_zero()).map(|d| d.seconds_f64());
+        let duration = self.playbin().query_duration::<gst::ClockTime>().filter(|d| !d.is_zero()).map(|d| d.seconds_f64());
+        let fade_ms = self.shared.crossfade_ms.load(Ordering::Acquire);
+        if let (true, gst::State::Playing, Some(duration)) = (fade_ms > 0, state, duration) {
+            if self.fade.borrow().is_none() && !self.shared.live.load(Ordering::Acquire) {
+                let secs = (f64::from(fade_ms) / 1000.0).min(duration / 2.0);
+                if duration - position.seconds_f64() <= secs {
+                    self.crossfade_into_armed(secs);
+                    return;
+                }
+            }
+        }
         let _ = self.telemetry.force_send(AudioTelemetry::Position { generation: self.generation(), position: position.seconds_f64(), duration });
     }
 }

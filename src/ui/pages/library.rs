@@ -25,6 +25,11 @@ use crate::ui::widgets::media_card::{CardOptions, MediaCard};
 const VIEW_MODES: [&str; 2] = ["list", "grid"];
 const DEFAULT_VIEW_MODE: &str = "grid";
 pub(crate) const DOWNLOADS_ID: &str = "DL";
+pub(crate) const LOCAL_FILES_ID: &str = "LF";
+
+fn is_injected(id: &str) -> bool {
+    id == DOWNLOADS_ID || id == LOCAL_FILES_ID
+}
 /// A library shown again within this long is fresh enough to leave alone.
 const RELOAD_GAP: std::time::Duration = std::time::Duration::from_secs(2);
 
@@ -330,7 +335,7 @@ impl LibraryPage {
             }
             for (section, cacheable) in &sections {
                 // Downloads and the playlists kept on this device need no network.
-                let available = |id: &str| id == DOWNLOADS_ID || crate::local_library::is_local(id) || (*cacheable && cached.contains(id));
+                let available = |id: &str| is_injected(id) || crate::local_library::is_local(id) || (*cacheable && cached.contains(id));
                 // The list shows the filtered model, so its rows follow that order.
                 for (i, row) in list_rows(&section.list).into_iter().enumerate() {
                     let id = section.filtered.item(i as u32).and_downcast::<MediaObject>().map(|o| o.id()).unwrap_or_default();
@@ -536,7 +541,7 @@ impl LibraryPage {
         for index in 0..section.store.n_items().min(10) {
             let Some(object) = section.store.item(index).and_downcast::<MediaObject>() else { continue };
             let item = object.item();
-            if item.kind != ItemKind::Playlist || item.id == DOWNLOADS_ID {
+            if item.kind != ItemKind::Playlist || is_injected(&item.id) {
                 continue;
             }
             let labels: Vec<String> = playlist_extras(&self.ctx, self.root.upcast_ref(), &item).into_iter().map(|action| action.label).collect();
@@ -570,7 +575,7 @@ impl LibraryPage {
         // Signed out, every card comes from this device and is read again below.
         let remote: Vec<MediaItem> = (0..store.n_items())
             .filter_map(|i| store.item(i).and_downcast::<MediaObject>().map(|o| o.item()))
-            .filter(|item| signed_in && item.id != DOWNLOADS_ID && !crate::local_library::is_local(&item.id))
+            .filter(|item| signed_in && !is_injected(&item.id) && !crate::local_library::is_local(&item.id))
             .collect();
         sync_store(store, with_local_items(&self.ctx, remote));
         if !signed_in {
@@ -585,7 +590,7 @@ impl LibraryPage {
         section.list.bind_model(Some(&section.filtered), move |object| {
             let item = object.downcast_ref::<MediaObject>().map(MediaObject::item).unwrap_or_default();
             let row = list_row(&ctx, &item);
-            if item.id != DOWNLOADS_ID {
+            if !is_injected(&item.id) {
                 attach_playlist_menu(&ctx, &row, item.clone());
             }
             row.upcast()
@@ -621,7 +626,7 @@ impl LibraryPage {
                     page.activate(item);
                 }
             });
-            if item.id != DOWNLOADS_ID {
+            if !is_injected(&item.id) {
                 attach_playlist_menu(&self.ctx, card.widget(), item.clone());
             }
             section.grid.append(card.widget());
@@ -639,6 +644,9 @@ impl LibraryPage {
         match item.kind {
             ItemKind::Playlist if item.id == DOWNLOADS_ID => {
                 let _ = self.root.activate_action("win.open-downloads", None);
+            }
+            ItemKind::Playlist if item.id == LOCAL_FILES_ID => {
+                let _ = self.root.activate_action("win.open-local-files", None);
             }
             ItemKind::Playlist => self.ctx.nav.go(NavRequest::Playlist { id: item.id.clone(), title: item.title.clone(), thumb: item.thumb.clone() }),
             ItemKind::Album => self.ctx.nav.go(NavRequest::Album { id: item.id.clone(), title: item.title.clone(), thumb: item.thumb.clone() }),
@@ -724,13 +732,17 @@ fn downloads_entry() -> MediaItem {
     MediaItem { kind: ItemKind::Playlist, id: DOWNLOADS_ID.to_owned(), title: "Downloads".to_owned(), description: Some("Downloaded songs".to_owned()), ..MediaItem::default() }
 }
 
+fn local_files_entry() -> MediaItem {
+    MediaItem { kind: ItemKind::Playlist, id: LOCAL_FILES_ID.to_owned(), title: "Local Files".to_owned(), description: Some("Songs from your music folder".to_owned()), ..MediaItem::default() }
+}
+
 /// The account's playlists with what lives on this device: YouTube's likes
 /// list stays first when there is one, then Downloads, then the local likes
 /// and playlists, then the rest.
 fn with_local_items(ctx: &UiContext, remote: Vec<MediaItem>) -> Vec<MediaItem> {
     let mut items = remote;
     let head = items.len().min(1);
-    let mut local = vec![downloads_entry()];
+    let mut local = vec![downloads_entry(), local_files_entry()];
     // Not "authenticated": offline the session cannot be verified, and the
     // empty local list showed up beside YouTube's own Liked Music.
     let signed_out = matches!(ctx.net.client().auth_state(), crate::net::ytmusic::AuthState::Anonymous);
@@ -758,6 +770,7 @@ fn saved_albums(ctx: &UiContext) -> Vec<MediaItem> {
 fn card_style(item: &MediaItem) -> (String, &'static str, Option<&'static str>) {
     match item.kind {
         ItemKind::Playlist if item.id == DOWNLOADS_ID => (item.description.clone().unwrap_or_default(), "media-playlist-audio-symbolic", Some("folder-download-symbolic")),
+        ItemKind::Playlist if item.id == LOCAL_FILES_ID => (item.description.clone().unwrap_or_default(), "media-playlist-audio-symbolic", Some("folder-music-symbolic")),
         // An empty playlist on this device has no art yet. It gets the tile Downloads wears.
         ItemKind::Playlist if crate::local_library::is_local(&item.id) && item.thumb.is_none() => (item.description.clone().unwrap_or_default(), "folder-music-symbolic", Some("audio-x-generic-symbolic")),
         ItemKind::Playlist if item.id.len() == 2 || crate::local_library::is_local(&item.id) => (item.description.clone().unwrap_or_default(), "folder-music-symbolic", None),
@@ -804,9 +817,10 @@ fn list_row(ctx: &Rc<UiContext>, item: &MediaItem) -> gtk::ListBoxRow {
     let inner = gtk::Box::builder().orientation(gtk::Orientation::Horizontal).spacing(12).css_classes(["song-row"]).build();
     row.set_child(Some(&inner));
 
-    if item.id == DOWNLOADS_ID {
+    if is_injected(&item.id) {
+        let icon = if item.id == DOWNLOADS_ID { "folder-download-symbolic" } else { "folder-music-symbolic" };
         let icon_box = gtk::Box::builder().orientation(gtk::Orientation::Vertical).css_classes(["song-download-icon", "song-img"]).vexpand(false).build();
-        icon_box.append(&gtk::Image::builder().icon_name("folder-download-symbolic").halign(gtk::Align::Center).valign(gtk::Align::Center).vexpand(true).build());
+        icon_box.append(&gtk::Image::builder().icon_name(icon).halign(gtk::Align::Center).valign(gtk::Align::Center).vexpand(true).build());
         inner.append(&icon_box);
     } else {
         let cover = CoverImage::in_context(ctx, 56);
@@ -874,7 +888,7 @@ fn list_rows(list: &gtk::ListBox) -> Vec<gtk::ListBoxRow> {
 /// A library card's menu, with the entries only the library offers: a
 /// playlist of your own can be deleted, one you saved can be dropped again.
 fn attach_playlist_menu(ctx: &Rc<UiContext>, widget: &impl IsA<gtk::Widget>, item: MediaItem) {
-    let is_playlist = item.kind == ItemKind::Playlist && item.id != DOWNLOADS_ID;
+    let is_playlist = item.kind == ItemKind::Playlist && !is_injected(&item.id);
     // An album saved without an account can be dropped again too.
     let saved_here = !ctx.net.client().is_authenticated() && ctx.local.is_saved(&item.id);
     if !is_playlist && !is_upload_album(&item) && !saved_here {

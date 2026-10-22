@@ -13,6 +13,8 @@
     <file preprocess="xml-stripblanks">hicolor/scalable/actions/ko-fi-symbolic.svg</file>
     <file preprocess="xml-stripblanks">hicolor/scalable/actions/github-symbolic.svg</file>
     <file preprocess="xml-stripblanks">hicolor/scalable/actions/heart-outline-thick-symbolic.svg</file>
+    <file preprocess="xml-stripblanks">hicolor/scalable/actions/list-drag-handle-symbolic.svg</file>
+    <file preprocess="xml-stripblanks">hicolor/scalable/actions/window-close-symbolic.svg</file>
     <file preprocess="xml-stripblanks">hicolor/scalable/apps/com.pocoguy.Muse.svg</file>
     <file preprocess="xml-stripblanks">hicolor/symbolic/apps/com.pocoguy.Muse-symbolic.svg</file>
   </gresource>

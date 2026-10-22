@@ -7,7 +7,7 @@ use std::rc::Rc;
 use std::time::{Duration, Instant};
 
 use adw::prelude::*;
-use gtk::{gdk, glib};
+use gtk::{gdk, gio, glib};
 use serde_json::Value;
 
 use crate::App;
@@ -33,6 +33,7 @@ pub fn present(win: &Rc<MainWindow>, ctx: &Rc<App>) -> adw::PreferencesDialog {
     general.add(&account_group(win, ctx, &dialog));
     general.add(&playback_group(win, ctx));
     general.add(&downloads_group(win, ctx));
+    general.add(&local_files_group(win, ctx));
     general.add(&updates_group(ctx));
     dialog.add(&general);
 
@@ -372,6 +373,34 @@ fn playback_group(win: &Rc<MainWindow>, ctx: &Rc<App>) -> adw::PreferencesGroup 
         queue_row.connect_active_notify(move |row| save(&ctx, "auto_open_queue", row.is_active()));
     }
     group.add(&queue_row);
+
+    let crossfade_on = pref_bool(ctx, "crossfade_enabled", false);
+    let crossfade_seconds = ctx.paths.read_prefs().get("crossfade_seconds").and_then(Value::as_f64).unwrap_or(crate::player::CROSSFADE_DEFAULT_SECONDS).clamp(0.0, 10.0);
+    let crossfade_row = switch_row("Crossfade", "Fade the end of a song into the start of the next", crossfade_on);
+    let (length_row, length_scale) = scale_row("Crossfade Length", "Seconds the two songs overlap", (0.0, 10.0, 1.0), crossfade_seconds, 0);
+    length_row.set_visible(crossfade_on);
+    {
+        let ctx = ctx.clone();
+        let (length_row, length_scale) = (length_row.clone(), length_scale.clone());
+        crossfade_row.connect_active_notify(move |row| {
+            let on = row.is_active();
+            save(&ctx, "crossfade_enabled", on);
+            length_row.set_visible(on);
+            ctx.player.set_crossfade(if on { length_scale.value() } else { 0.0 });
+        });
+    }
+    {
+        let ctx = ctx.clone();
+        let crossfade_row = crossfade_row.clone();
+        length_scale.connect_value_changed(move |scale| {
+            save(&ctx, "crossfade_seconds", scale.value());
+            if crossfade_row.is_active() {
+                ctx.player.set_crossfade(scale.value());
+            }
+        });
+    }
+    group.add(&crossfade_row);
+    group.add(&length_row);
 
     let songs_row = switch_row("Prefer Song Versions", "Play, queue and download the song in place of its music video when one is found by title and artist", pref_bool(ctx, crate::net::twins::PREF, true));
     {
@@ -1003,6 +1032,44 @@ fn reorganize(win: &Rc<MainWindow>, ctx: &Rc<App>, saved: &str) {
             win.add_toast(&message);
         }
     });
+}
+
+fn local_files_group(win: &Rc<MainWindow>, ctx: &Rc<App>) -> adw::PreferencesGroup {
+    let group = adw::PreferencesGroup::builder().title("Local Files").build();
+    let shown = |paths: &crate::paths::Paths| crate::local_files::folder(paths).map(|f| f.display().to_string()).unwrap_or_else(|| "No folder chosen".to_owned());
+    let row = adw::ActionRow::builder().title("Music Folder").subtitle(glib::markup_escape_text(&shown(&ctx.paths))).build();
+    let choose = gtk::Button::builder().label("Choose…").valign(gtk::Align::Center).build();
+    let clear = gtk::Button::builder().icon_name("edit-clear-symbolic").tooltip_text("Stop listing this folder").valign(gtk::Align::Center).css_classes(["flat"]).visible(crate::local_files::folder(&ctx.paths).is_some()).build();
+    {
+        let (ctx, row, clear) = (ctx.clone(), row.clone(), clear.clone());
+        let win = Rc::downgrade(win);
+        choose.connect_clicked(move |_| {
+            let Some(win) = win.upgrade() else { return };
+            let dialog = gtk::FileDialog::builder().title("Choose Music Folder").build();
+            if let Some(folder) = crate::local_files::folder(&ctx.paths) {
+                dialog.set_initial_folder(Some(&gio::File::for_path(folder)));
+            }
+            let (ctx, row, clear) = (ctx.clone(), row.clone(), clear.clone());
+            dialog.select_folder(Some(win.window()), None::<&gio::Cancellable>, move |result| {
+                let Some(path) = result.ok().and_then(|file| file.path()) else { return };
+                save(&ctx, crate::local_files::PREF, path.to_string_lossy().into_owned());
+                row.set_subtitle(&glib::markup_escape_text(&path.display().to_string()));
+                clear.set_visible(true);
+            });
+        });
+    }
+    {
+        let (ctx, row) = (ctx.clone(), row.clone());
+        clear.connect_clicked(move |button| {
+            save(&ctx, crate::local_files::PREF, "");
+            row.set_subtitle("No folder chosen");
+            button.set_visible(false);
+        });
+    }
+    row.add_suffix(&clear);
+    row.add_suffix(&choose);
+    group.add(&row);
+    group
 }
 
 fn downloads_group(win: &Rc<MainWindow>, ctx: &Rc<App>) -> adw::PreferencesGroup {

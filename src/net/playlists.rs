@@ -97,7 +97,7 @@ pub fn saved_id(playlist_id: &str) -> &str {
 /// not a radio, the account's likes, a podcast, an upload or a list made here.
 pub fn is_savable(page_id: &str) -> bool {
     let id = saved_id(page_id);
-    !(id.is_empty() || id == "LM" || id.starts_with("RD") || id.starts_with("FEmusic") || id.starts_with("UPLOAD") || id == "DOWNLOADS" || id == "HISTORY" || is_podcast(id) || crate::local_library::is_local(id))
+    !(id.is_empty() || id == "LM" || id.starts_with("RD") || id.starts_with("FEmusic") || id.starts_with("UPLOAD") || id == "DOWNLOADS" || id == crate::local_files::PAGE_ID || id == "HISTORY" || is_podcast(id) || crate::local_library::is_local(id))
 }
 
 // -- playlists ------------------------------------------------------------

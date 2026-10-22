@@ -14,6 +14,7 @@ mod bootstrap;
 mod demo;
 mod discord;
 mod downloads;
+mod local_files;
 mod local_library;
 mod lyrics;
 mod model;
@@ -226,7 +227,21 @@ fn on_startup(ctx: &Rc<App>) {
     if !prefs.get("force_offline").and_then(|v| v.as_bool()).unwrap_or(false) {
         ctx.player.fill_liked_stubs();
     }
-    ctx.player.restore_session(prefs.get("autoplay_on_start").and_then(|v| v.as_bool()).unwrap_or(false));
+    let autoplay = prefs.get("autoplay_on_start").and_then(|v| v.as_bool()).unwrap_or(false);
+    match local_files::folder(&ctx.paths) {
+        Some(folder) => {
+            let cache = ctx.paths.cache_dir.clone();
+            let handle = ctx.net.spawn(async move { tokio::task::spawn_blocking(move || local_files::scan(&folder, &cache)).await });
+            let player = ctx.player.clone();
+            glib::spawn_future_local(async move {
+                let _ = handle.await;
+                if player.queue_tracks().is_empty() {
+                    player.restore_session(autoplay);
+                }
+            });
+        }
+        None => ctx.player.restore_session(autoplay),
+    }
     ctx.mpris.replace(Some(Mpris::start(ctx)));
     tray::start(ctx);
     presence::wire(ctx);
