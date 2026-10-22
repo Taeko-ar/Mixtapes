@@ -43,19 +43,17 @@ echo "App, Info.plist and icon"
 cp "$BIN" "$C/MacOS/mixtapes"
 sed -e "s/@VERSION@/$VERSION/g" -e "s/@MIN_MACOS@/$MIN_MACOS/g" mac/Info.plist > "$C/Info.plist"
 printf 'APPL????' > "$C/PkgInfo"
+# mixtapes.icns is Icon Composer's Default export of mac/Mixtapes.icon, for
+# macOS 15 and earlier.
 cp mac/mixtapes.icns "$R/"
 # The layered Liquid Glass icon from Icon Composer (mac/Mixtapes.icon), for
 # macOS 26 and later, which frame the flat icns in a grey square. actool comes
-# with Xcode 26 only. Without it the flat icon is all the app gets. actool
-# also writes an icns from the same layers for older macOS.
+# with Xcode 26 only. Without it the flat icon is all the app gets.
 if xcrun --find actool > /dev/null 2>&1; then
     icon_out=$(mktemp -d)
     xcrun actool mac/Mixtapes.icon --compile "$icon_out" --platform macosx --minimum-deployment-target "$MIN_MACOS" \
         --app-icon Mixtapes --output-partial-info-plist "$icon_out/partial.plist" > /dev/null
     cp "$icon_out/Assets.car" "$R/"
-    if [[ -f "$icon_out/Mixtapes.icns" ]]; then
-        cp "$icon_out/Mixtapes.icns" "$R/mixtapes.icns"
-    fi
     /usr/libexec/PlistBuddy -c "Add :CFBundleIconName string Mixtapes" "$C/Info.plist"
     rm -rf "$icon_out"
 else
