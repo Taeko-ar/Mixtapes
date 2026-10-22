@@ -23,8 +23,9 @@ if [[ -z "${PREFIX:-}" ]]; then
     done
 fi
 : "${PREFIX:?no GTK 4 install found, set PREFIX}"
-# Only this prefix: a cross build's runner has the other architecture's packages too.
-export PKG_CONFIG_LIBDIR="$PREFIX/lib/pkgconfig:$PREFIX/share/pkgconfig"
+# This prefix first. A cross build also sets PKG_CONFIG_LIBDIR to keep the
+# runner's own packages out (see .github/workflows/build-macos.yml).
+export PKG_CONFIG_PATH="$PREFIX/lib/pkgconfig:$PREFIX/share/pkgconfig${PKG_CONFIG_PATH:+:$PKG_CONFIG_PATH}"
 PKG_CONFIG=${PKG_CONFIG:-$(command -v pkg-config || command -v pkgconf || echo "$PREFIX/bin/pkg-config")}
 
 BIN=target/${TARGET:+$TARGET/}release/mixtapes

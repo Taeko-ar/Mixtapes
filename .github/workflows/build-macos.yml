@@ -90,11 +90,13 @@ jobs:
           key: macos-${{ matrix.arch }}-cargo-${{ hashFiles('Cargo.lock') }}
           restore-keys: macos-${{ matrix.arch }}-cargo-
 
-      - name: Build environment
-        # pkg-config sees only the target's prefix, so the Intel build cannot
-        # pick up Homebrew's arm64 libraries.
+      - name: Cross-build environment
+        # pkg-config sees only MacPorts' prefix, so the Intel build cannot pick
+        # up Homebrew's arm64 libraries. The arm64 build keeps Homebrew's own
+        # search path, which also covers keg-only libffi.
+        if: matrix.arch == 'x86_64'
         run: |
-          echo "PKG_CONFIG_LIBDIR=${{ matrix.prefix }}/lib/pkgconfig:${{ matrix.prefix }}/share/pkgconfig" >> "$GITHUB_ENV"
+          echo "PKG_CONFIG_LIBDIR=/opt/local/lib/pkgconfig:/opt/local/share/pkgconfig" >> "$GITHUB_ENV"
           echo "PKG_CONFIG_ALLOW_CROSS=1" >> "$GITHUB_ENV"
 
       - name: Toolchain versions
