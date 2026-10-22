@@ -2637,9 +2637,7 @@ fn start_when_frames_flow<W: IsA<gtk::Widget>>(widget: &W, start: impl Fn(&W) + 
     });
 }
 
-/// Route window controls to whichever pane owns the outer trailing edge.
-/// macOS draws its native buttons on the leading edge only, so there the
-/// content keeps them whenever the queue is not on its left.
+/// Route window controls to whichever pane owns each outer edge.
 fn apply_window_controls_position(
     split_view: &adw::OverlaySplitView,
     content_hdr: &adw::HeaderBar,
@@ -2647,9 +2645,9 @@ fn apply_window_controls_position(
 ) {
     let is_right = split_view.sidebar_position() == gtk::PackType::End;
     let visible = split_view.shows_sidebar() && !split_view.is_collapsed();
-    let sidebar_owns_trailing = is_right && visible;
     let sidebar_owns_leading = !is_right && visible;
-    content_hdr.set_show_start_title_buttons(sidebar_owns_trailing || (cfg!(target_os = "macos") && !sidebar_owns_leading));
+    let sidebar_owns_trailing = is_right && visible;
+    content_hdr.set_show_start_title_buttons(!sidebar_owns_leading);
     content_hdr.set_show_end_title_buttons(!sidebar_owns_trailing);
     queue_panel.set_window_controls(sidebar_owns_leading, sidebar_owns_trailing);
 }
