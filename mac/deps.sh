@@ -29,6 +29,16 @@ manifest_dir=$(mktemp -d)
 cd "$PREFIX"
 files=(lib/*.dylib lib/pkgconfig lib/gstreamer-1.0 lib/gio/modules libexec/gstreamer-1.0/gst-plugin-scanner
     share/glib-2.0/schemas/gschemas.compiled share/icons/hicolor)
+# Some ports link their libraries and pkg-config files into lib from
+# elsewhere: OpenSSL and SDL from libexec, libstdc++ from lib/libgcc. The
+# targets go in too, or the links would dangle on the runner.
+while IFS= read -r link; do
+    target=$(readlink "$link")
+    case "$target" in
+        "$PREFIX"/*) files+=("${target#"$PREFIX"/}") ;;
+        */*) files+=("$(dirname "$link")/$target") ;;
+    esac
+done < <(find lib/*.dylib lib/pkgconfig -type l)
 tar -cJf "$OUT" -C "$manifest_dir" ports.txt -C "$PREFIX" "${files[@]}"
 rm -rf "$manifest_dir"
 

@@ -20,7 +20,7 @@ env:
   # The x86_64 stack. A new one needs mac/deps.sh run on an Intel Mac, the
   # tarball attached to a new release, and both values here updated.
   DEPS_TAG: macos-deps-1
-  DEPS_SHA256: 8e0336376850d73318cfb077a905f1c1d03597d3f204ddb6653fd659495b574e
+  DEPS_SHA256: feb6c7e52134d39b203d768a49dc4169432fef60b22bc6f58b14d0a57fc24c61
   # The oldest macOS the builds run on: the Homebrew bottles and the MacPorts
   # stack are both built for Sequoia.
   MACOSX_DEPLOYMENT_TARGET: "15.0"
