@@ -172,12 +172,22 @@ codesign --force --sign - "$C/MacOS/gst-plugin-scanner" "$C/MacOS/yt-dlp" "$C/Ma
 codesign --force --sign - "$APP" 2> /dev/null
 
 echo "Disk image"
+# create-dmg has Finder lay the window out over the background, through
+# AppleScript. dmgbuild writes the same settings without Finder, but on macOS 15
+# Finder ignores the background it records. The first run from a terminal or
+# SSH asks for permission to control Finder.
+# tiffutil merges the 1x and 2x backgrounds into one image Retina screens pick
+# from. The window is 28 points taller than the 640x400 background, for the title bar.
 DMG="dist/Mixtapes-$VERSION-$ARCH.dmg"
-stage=$(mktemp -d)
-cp -R "$APP" "$stage/"
-ln -s /Applications "$stage/Applications"
+dmg_tmp=$(mktemp -d)
+mkdir "$dmg_tmp/stage"
+cp -R "$APP" "$dmg_tmp/stage/"
+tiffutil -cathidpicheck mac/dmg-background.png mac/dmg-background@2x.png -out "$dmg_tmp/background.tiff" 2> /dev/null
 rm -f "$DMG"
-hdiutil create -quiet -volname Mixtapes -srcfolder "$stage" -format UDZO -ov "$DMG"
-rm -rf "$stage"
+create-dmg --volname Mixtapes --volicon "$R/mixtapes.icns" --background "$dmg_tmp/background.tiff" \
+    --window-pos 200 120 --window-size 640 428 --icon-size 128 --text-size 13 \
+    --icon Mixtapes.app 160 190 --hide-extension Mixtapes.app --app-drop-link 480 190 \
+    --format ULMO --hdiutil-quiet "$DMG" "$dmg_tmp/stage" > /dev/null
+rm -rf "$dmg_tmp"
 
 echo "Done: $APP ($(du -sh "$APP" | cut -f1)), $DMG ($(du -sh "$DMG" | cut -f1))"
